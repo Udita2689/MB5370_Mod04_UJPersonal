@@ -2,6 +2,7 @@
 .Rhistory
 .RData
 .Ruserdata
+
 # Files to ignore
 .Rproj.user
 .Rhistory
