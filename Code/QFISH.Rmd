@@ -1,0 +1,237 @@
+---
+title: "QFISH SCP Report"
+author: "Udita Jahan"
+date: "2025-09-19"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+#This report uses QFISH Shark Control Program data to show how yearly catches 
+#change for each species group and which areas contribute most. The raw CSV 
+#has been turned into tidy data and present one clear, stakeholder-friendly 
+#figure.
+
+```{r}
+## PURPOSE: Load core packages for tidy data work and plotting.
+suppressPackageStartupMessages({
+  library(tidyverse)  # dplyr, tidyr, ggplot2, readr, tibble
+  library(janitor)    # clean_names()
+  library(scales)     # label_number()
+  library(stringr)    # string helpers
+})
+```
+
+
+```{r}
+# PURPOSE: Read the QFISH CSV as-is (no headers). QFISH exports use a 
+#2-row header.
+# ACTIONS:
+# 1) Read CSV with col_names = FALSE.
+# 2) Find the row that says "Calendar Year"; the next row lists "Area" 
+#and species groups.
+# 3) Split the file into:
+#    - areas_raw: left-most column (area names)
+#    - values_raw: wide matrix with year_group columns
+# 4) Build machine-readable names like "2014_Shark"; drop "Total" columns 
+#and blanks.
+
+path <- "E:/MB5370/github/MB5370_Mod04_UJPersonal/Data/export.csv"
+raw  <- readr::read_csv(path, col_names = FALSE, show_col_types = FALSE)
+
+
+first_col <- raw[[1]] |> as.character()
+hdr_year_row <- which(str_detect(first_col, 
+      regex("^Calendar\\s*Year$|^CalendarYear$", ignore_case = TRUE)))[1]
+if (is.na(hdr_year_row)) hdr_year_row <- 1L
+hdr_group_row <- hdr_year_row + 1L
+
+year_head  <- raw[hdr_year_row, ] |> unlist() |> as.character() |> str_squish()
+group_head <- raw[hdr_group_row, ] |> unlist() |> as.character() |> str_squish()
+
+data_start <- hdr_group_row + 1L
+areas_raw  <- raw[data_start:nrow(raw), 1,  drop = FALSE]
+values_raw <- raw[data_start:nrow(raw), -1, drop = FALSE]
+
+
+yr  <- year_head[-1]
+grp <- group_head[-1]
+nm  <- ifelse(grepl("Total", yr, ignore.case = TRUE) | is.na(grp) | grp == "",
+              NA_character_, paste0(yr, "_", grp))
+colnames(values_raw) <- nm
+values_raw <- values_raw[, !is.na(colnames(values_raw)), drop = FALSE]
+
+```
+
+
+```{r}
+# Keep only genuine areas and make the value cells numeric.
+# Drop blanks and the "Grand Total" row (they're not real locations).
+# Apply parse_number() to every value column (safe even if commas/text appear).
+
+area_vec <- as.character(areas_raw[[1]])
+keep_row <- !is.na(area_vec) & nzchar(area_vec) &
+            !str_detect(area_vec, regex("^Grand\\s*Total$", ignore_case = TRUE))
+
+areas2  <- tibble(area = area_vec[keep_row])
+values2 <- values_raw[keep_row, , drop = FALSE] |>
+           mutate(across(everything(), readr::parse_number))
+
+tidy <- bind_cols(areas2, values2) |>
+  clean_names() |>
+  pivot_longer(-area, names_to = "year_group", values_to = "count") |>
+  mutate(
+    year_group = str_replace(year_group, "^[^0-9]+", ""),
+    #strip any leading non-digits
+    .after = area
+  ) |>
+  separate(year_group, into = c("year", "group"), sep = "_", fill = "right") |>
+  mutate(
+    year  = readr::parse_integer(year),
+    group = factor(str_to_lower(group))
+  ) |>
+  filter(!is.na(year), !is.na(count))
+
+```
+
+```{r}
+# PURPOSE: Reshape to a tidy table with one row per area-year-species group.
+# bind_cols(area, values) then clean_names()
+# pivot_longer() to long format
+# strip any leading "x"/non-digits from column names (from clean_names())
+# separate into year and group
+# set proper types (year: integer; group: factor)
+# drop rows with missing year or count
+
+summary_df <- tidy |>
+  summarise(
+    n_rows   = n(),
+    min_year = min(year, na.rm = TRUE),
+    max_year = max(year, na.rm = TRUE),
+    n_areas  = n_distinct(area),
+    n_groups = n_distinct(group)
+  )
+summary_df
+
+count(tidy, group, sort = TRUE)
+stopifnot(sum(is.na(tidy$count)) == 0)
+
+```
+
+```{r}
+by_spp_area_year <- tidy |>
+  group_by(group, area, year) |>
+  summarise(total = sum(count, na.rm = TRUE), .groups = "drop")
+
+# Top-3 within each species group
+top3_by_group <- by_spp_area_year |>
+  group_by(group, area) |>
+  summarise(grand_total = sum(total), .groups = "drop_last") |>
+  slice_max(grand_total, n = 3, with_ties = FALSE) |>
+  ungroup()
+
+plot_df <- by_spp_area_year |>
+  semi_join(top3_by_group, by = c("group","area"))
+
+```
+
+
+
+```{r}
+# 1) Order areas by cumulative total
+area_order <- plot_df %>%
+  group_by(area) %>%
+  summarise(grand_total = sum(total, na.rm = TRUE), .groups = "drop") %>%
+  arrange(desc(grand_total)) %>%
+  pull(area)
+
+# 2)shorten long legend labels
+short_names <- setNames(
+  str_replace(area_order, "Sunshine Coast North", "Sunshine Coast N"),
+  area_order
+)
+legend_labels <- short_names[area_order]           
+# <- these are the labels used in the plot
+
+# 3) Build the plotting data with the FINAL factor levels/labels
+plot_dat <- plot_df %>%
+  mutate(area = factor(area, levels = area_order, labels = legend_labels))
+
+# 4) Palette named by the **labels shown** (NOT the original names)
+okabe_ito <- c("#0072B2","#D55E00","#009E73","#E69F00",
+               "#56B4E9","#F0E442","#CC79A7","#000000")
+
+pal <- setNames(rep(okabe_ito, length.out = length(legend_labels)), 
+                legend_labels)
+
+#Force strong contrast for specific labels (keys must match legend text exactly)
+pal["Rainbow Beach"] <- "#0072B2"  # blue
+pal["Gold Coast"]     <- "#F0E442" # magenta
+
+
+
+# 5) Plot (now the mapping will stick)
+p_legend <- ggplot(plot_dat, aes(year, total, color = area)) + #linetype = area
+  geom_line(linewidth = 0.7) +
+  geom_point(size = 1) +
+  facet_wrap(~ group, scales = "free_y") +
+  scale_color_manual(values = pal, name = "Area", breaks = legend_labels) +
+  # + scale_linetype_manual(values = lty, name = "Area")
+  scale_y_continuous(labels = scales::label_number(big.mark = ",")) +
+  labs(
+    title = "Catches over time by species group and area",
+    subtitle = "Top 3 areas within each species group",
+    x = "Year", y = "Total caught",
+    caption = "Notes: Axes vary by panel; totals are not effort-adjusted. 
+    Data: QFISH Shark Control Program."
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    panel.grid.minor = element_blank(),
+    strip.text = element_text(face = "bold"),
+    legend.position = "bottom",
+    legend.box = "horizontal",
+    legend.title = element_text(face = "bold"),
+    legend.text  = element_text(size = 10),
+    legend.key.width  = unit(18, "pt"),
+    legend.key.height = unit(12, "pt")
+  ) +
+  guides(color = guide_legend(nrow = 2, byrow = TRUE,
+                              override.aes = list(linewidth = 1, size = 1.2)))
+  # + guides(linetype = guide_legend(nrow = 2, byrow = TRUE))
+
+p_legend
+
+```
+
+
+```{r}
+
+# Locate the Rmd’s folder when knitting; if running from the Console,
+#use getwd()
+rmd_dir <- tryCatch(dirname(normalizePath(knitr::current_input())),
+                    error = function(e) getwd())
+
+out_dir  <- file.path(rmd_dir, "output")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+out_file <- file.path(out_dir, "ts_species_byarea_top3_with_legend.png")
+
+# Save
+ggsave(filename = out_file, plot = p_legend,
+       width = 12, height = 8, dpi = 320, bg = "white")
+
+# Confirm + open folder
+cat("Saved to:", normalizePath(out_file), "\n")
+browseURL(normalizePath(out_dir))
+
+```
+
+
+
+
+
+
+
+
+
